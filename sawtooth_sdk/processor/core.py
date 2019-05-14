@@ -20,6 +20,7 @@ import logging
 
 
 from sawtooth_sdk.messaging.exceptions import ValidatorConnectionError
+from sawtooth_sdk.messaging.exceptions import ValidatorVersionError
 from sawtooth_sdk.messaging.future import FutureTimeoutError
 from sawtooth_sdk.messaging.stream import RECONNECT_EVENT
 from sawtooth_sdk.messaging.stream import Stream
@@ -40,6 +41,12 @@ from sawtooth_sdk.protobuf.validator_pb2 import Message
 
 
 LOGGER = logging.getLogger(__name__)
+
+# This is the version used by SDK to match if validator supports feature it
+# requested during registration. It should only be incremented when there are
+# changes in TpRegisterRequest. Remember to sync this information in
+# validator if changed.
+SDK_PROTOCOL_VERSION = 1
 
 
 class TransactionProcessor:
@@ -95,7 +102,8 @@ class TransactionProcessor:
                 [TpRegisterRequest(
                     family=n,
                     version=v,
-                    namespaces=h.namespaces)
+                    namespaces=h.namespaces,
+                    protocol_version=SDK_PROTOCOL_VERSION)
                  for n, v in itertools.product(
                     [h.family_name],
                      h.family_versions,)] for h in self._handlers])
@@ -228,8 +236,18 @@ class TransactionProcessor:
             resp = TpRegisterResponse()
             try:
                 resp.ParseFromString(future.result().content)
+                if resp.protocol_version != SDK_PROTOCOL_VERSION:
+                    LOGGER.error("Validator version %s does not support "
+                                 "requested feature by SDK version %s. "
+                                 "Unregistering with the validator.",
+                                 str(resp.protocol_version),
+                                 str(SDK_PROTOCOL_VERSION))
+                    raise ValidatorVersionError()
                 LOGGER.info("register attempt: %s",
                             TpRegisterResponse.Status.Name(resp.status))
+                if resp.status == TpRegisterResponse.ERROR:
+                    raise RuntimeError("Transaction processor registration "
+                                       "failed")
             except ValidatorConnectionError as vce:
                 LOGGER.info("during waiting for response on registration: %s",
                             vce)
@@ -263,7 +281,7 @@ class TransactionProcessor:
                 # spend most of its time
                 fut = self._stream.receive()
                 self._process_future(fut)
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, ValidatorVersionError):
             try:
                 # tell the validator to not send any more messages
                 self._unregister()
@@ -284,6 +302,9 @@ class TransactionProcessor:
                 # If the validator is not able to respond to the
                 # unregister request, exit.
                 pass
+        except RuntimeError as e:
+            LOGGER.error("Error: %s", e)
+            self.stop()
 
     def stop(self):
         """Closes the connection between the TransactionProcessor and the
